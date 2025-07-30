@@ -5,22 +5,20 @@ import numpy as np
 
 import jax
 import jax.numpy as jnp
-from jax import grad, jit, random
+from jax import grad, pmap
+from jax.lib import xla_bridge # 用于获取设备信息
 
 import flax
 from flax import linen as nn
-from flax.training import train_state  # 方便管理训练状态
+from flax.training import train_state
 import optax
+from flax.jax_utils import replicate, unreplicate
 
 # -----------------------------------------------------------------------------
 # 1. 数据加载部分
 # -----------------------------------------------------------------------------
 
 def numpy_collate(batch):
-  """
-  这是一个自定义的 collate_fn，它将 PyTorch tensors 转换为 NumPy arrays。
-  这是连接 PyTorch 和 JAX 的关键桥梁。
-  """
   if isinstance(batch[0], np.ndarray):
     return np.stack(batch)
   elif isinstance(batch[0], (tuple,list)):
@@ -30,29 +28,29 @@ def numpy_collate(batch):
     return np.array(batch)
 
 def get_dataloaders(batch_size=128):
-    """创建并返回 MNIST 训练和测试的 DataLoader"""
-    # 定义数据变换，将图片转换为 tensor 并进行归一化
+    # <<< 注意：为了使用 pmap，batch_size 必须是设备数量的整数倍
+    num_devices = jax.local_device_count()
+    if batch_size % num_devices != 0:
+        raise ValueError(f"Batch size ({batch_size}) must be divisible by the number of devices ({num_devices})")
+
     transform = torchvision.transforms.Compose([
         torchvision.transforms.ToTensor(),
         torchvision.transforms.Normalize((0.1307,), (0.3081,))
     ])
 
-    # 下载并加载训练数据
     train_dataset = torchvision.datasets.MNIST(
         root='./data', train=True, download=True, transform=transform
     )
-    # 下载并加载测试数据
     test_dataset = torchvision.datasets.MNIST(
         root='./data', train=False, download=True, transform=transform
     )
 
-    # 创建 DataLoader
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=numpy_collate, # 使用我们的自定义 collate 函数！
-        drop_last=True, # JAX jit 编译要求输入形状固定，丢弃最后一个不完整的batch
+        collate_fn=numpy_collate,
+        drop_last=True,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -68,7 +66,6 @@ def get_dataloaders(batch_size=128):
 # -----------------------------------------------------------------------------
 
 class SimpleCNN(nn.Module):
-    """一个简单的卷积神经网络"""
     @nn.compact
     def __call__(self, x):
         x = nn.Conv(features=32, kernel_size=(3, 3))(x)
@@ -77,24 +74,20 @@ class SimpleCNN(nn.Module):
         x = nn.Conv(features=64, kernel_size=(3, 3))(x)
         x = nn.relu(x)
         x = nn.avg_pool(x, window_shape=(2, 2), strides=(2, 2))
-        x = x.reshape((x.shape[0], -1))  # 展平
+        x = x.reshape((x.shape[0], -1))
         x = nn.Dense(features=256)(x)
         x = nn.relu(x)
-        x = nn.Dense(features=10)(x) # 10个类别
+        x = nn.Dense(features=10)(x)
         return x
 
 # -----------------------------------------------------------------------------
 # 3. 训练和评估逻辑
 # -----------------------------------------------------------------------------
 
-
 class TrainState(train_state.TrainState):
-    # 在这里添加额外的状态，比如 batch_stats
     pass
 
-@jit
 def train_step(state, batch):
-    """单个训练步骤"""
     images, labels = batch
 
     def loss_fn(params):
@@ -103,68 +96,76 @@ def train_step(state, batch):
         loss = optax.softmax_cross_entropy(logits=logits, labels=one_hot).mean()
         return loss, logits
 
-    # 计算损失和梯度
     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     
-    # 更新模型状态（参数和优化器状态）
+    grads = jax.lax.pmean(grads, axis_name='batch')
     state = state.apply_gradients(grads=grads)
     
-    # 计算准确率
-    accuracy = jnp.mean(jnp.argmax(logits, -1) == labels)
+    loss = jax.lax.pmean(loss, axis_name='batch')
+    accuracy = jax.lax.pmean(jnp.mean(jnp.argmax(logits, -1) == labels), axis_name='batch')
     
     return state, loss, accuracy
 
-@jit
 def eval_step(state, batch):
-    """单个评估步骤（无梯度计算）"""
     images, labels = batch
     logits = state.apply_fn({'params': state.params}, images)
-    loss = optax.softmax_cross_entropy(logits=logits, labels=jax.nn.one_hot(labels, 10)).mean()
-    accuracy = jnp.mean(jnp.argmax(logits, -1) == labels)
+    
+    loss = jax.lax.pmean(optax.softmax_cross_entropy(logits=logits, labels=jax.nn.one_hot(labels, 10)).mean(), axis_name='batch')
+    accuracy = jax.lax.pmean(jnp.mean(jnp.argmax(logits, -1) == labels), axis_name='batch')
     return loss, accuracy
 
 
 def create_train_state(rng, learning_rate):
-    """创建初始的 TrainState"""
     model = SimpleCNN()
-    # JAX 要求输入形状是 (N, H, W, C)，而 PyTorch 是 (N, C, H, W)
-    # 我们将在数据加载后调整它
     params = model.init(rng, jnp.ones([1, 28, 28, 1]))['params']
     tx = optax.adam(learning_rate)
     return TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
+# <<< 新增：一个辅助函数，用于将数据分片到所有设备上
+def shard(data):
+    """将一个数据批次分片到所有可用的 JAX 设备上"""
+    # jax.tree_util.tree_map 可以对嵌套结构（如元组）的每个叶子节点应用函数
+    return jax.tree_util.tree_map(
+        lambda x: x.reshape((jax.local_device_count(), -1) + x.shape[1:]), data
+    )
 
 # -----------------------------------------------------------------------------
 # 4. 主函数
 # -----------------------------------------------------------------------------
 
 def main():
-    # 超参数
+    print(f"JAX backend: {xla_bridge.get_backend().platform}")
+    print(f"Number of devices: {jax.local_device_count()}")
+
     LEARNING_RATE = 1e-3
     BATCH_SIZE = 128
     EPOCHS = 5
 
-    # 获取 Dataloaders
     train_loader, test_loader = get_dataloaders(BATCH_SIZE)
 
-    # 创建初始状态
     rng = jax.random.PRNGKey(0)
     state = create_train_state(rng, LEARNING_RATE)
+    
+    state = replicate(state)
 
-    # 训练循环
+    # axis_name='batch' 使得我们可以在函数内部使用 pmean
+    p_train_step = pmap(train_step, axis_name='batch')
+    p_eval_step = pmap(eval_step, axis_name='batch')
+
     for epoch in range(1, EPOCHS + 1):
         # --- 训练 ---
         train_loss = 0.
         train_accuracy = 0.
         for batch_idx, (images, labels) in enumerate(train_loader):
-            # JAX/Flax Conv2D 需要 (N, H, W, C) 格式
-            # PyTorch DataLoader 输出 (N, C, H, W)
-            # 所以我们需要转换一下维度
             images = np.transpose(images, (0, 2, 3, 1))
             
-            state, loss, acc = train_step(state, (images, labels))
-            train_loss += loss
-            train_accuracy += acc
+            sharded_batch = shard((images, labels))
+            
+            # state, loss, acc 都是被复制到所有设备上的
+            state, loss, acc = p_train_step(state, sharded_batch)
+            
+            train_loss += loss[0] # 从设备上取回数值（所有设备上的值都一样）
+            train_accuracy += acc[0]
 
         avg_train_loss = train_loss / len(train_loader)
         avg_train_acc = train_accuracy / len(train_loader)
@@ -174,9 +175,13 @@ def main():
         test_accuracy = 0.
         for images, labels in test_loader:
             images = np.transpose(images, (0, 2, 3, 1))
-            loss, acc = eval_step(state, (images, labels))
-            test_loss += loss
-            test_accuracy += acc
+            sharded_batch = shard((images, labels))
+            
+            # 调用 pmap 版本的函数
+            loss, acc = p_eval_step(state, sharded_batch)
+            
+            test_loss += loss[0]
+            test_accuracy += acc[0]
         
         avg_test_loss = test_loss / len(test_loader)
         avg_test_acc = test_accuracy / len(test_loader)
@@ -186,7 +191,9 @@ def main():
             f"Train Loss: {avg_train_loss:.4f}, Train Acc: {avg_train_acc*100:.2f}% | "
             f"Test Loss: {avg_test_loss:.4f}, Test Acc: {avg_test_acc*100:.2f}%"
         )
-
+    
+    # 训练结束后，如果需要用单个模型参数做其他事，可以把它从设备上取回
+    # final_params = unreplicate(state.params)
 
 if __name__ == '__main__':
     main()
