@@ -1,7 +1,7 @@
 JAX backend: cpu
 Number of devices: 1
-Epoch 1 | Train Loss: 0.8764, Train Acc: 68.89% | Test Loss: 0.3583, Test Acc: 88.28%
-Epoch 2 | Train Loss: 0.2389, Train Acc: 92.39% | Test Loss: 0.1760, Test Acc: 94.65%
-Epoch 3 | Train Loss: 0.1610, Train Acc: 94.85% | Test Loss: 0.1516, Test Acc: 95.10%
-Epoch 4 | Train Loss: 0.1225, Train Acc: 96.09% | Test Loss: 0.1152, Test Acc: 96.55%
-Epoch 5 | Train Loss: 0.0969, Train Acc: 96.98% | Test Loss: 0.1082, Test Acc: 96.73%
+Epoch 1 | Train Loss: 0.8550, Train Acc: 69.79% | Test Loss: 1.6228, Test Acc: 48.86%
+Epoch 2 | Train Loss: 0.2519, Train Acc: 91.96% | Test Loss: 0.8531, Test Acc: 73.12%
+Epoch 3 | Train Loss: 0.1509, Train Acc: 95.30% | Test Loss: 0.3726, Test Acc: 87.84%
+Epoch 4 | Train Loss: 0.1171, Train Acc: 96.23% | Test Loss: 0.1826, Test Acc: 94.08%
+Epoch 5 | Train Loss: 0.0913, Train Acc: 97.03% | Test Loss: 0.1203, Test Acc: 96.05%

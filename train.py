@@ -1,73 +1,87 @@
 import torch
-import torchvision
 from torch.utils.data import DataLoader
 import numpy as np
+from einops import rearrange
+import webdataset as wds
+from torchvision import transforms
 
 import jax
 import jax.numpy as jnp
 from jax import pmap
-from jax.lib import xla_bridge
 
 import flax
 from flax.training import train_state
 import optax
 from flax.jax_utils import replicate, unreplicate
 
-
 from model import VisionTransformer
 
 # -----------------------------------------------------------------------------
-# 1. 数据加载部分
+# 1. 数据加载部分(WebDataset)
 # -----------------------------------------------------------------------------
-def numpy_collate(batch):
-  if isinstance(batch[0], np.ndarray):
-    return np.stack(batch)
-  elif isinstance(batch[0], (tuple,list)):
-    transposed = zip(*batch)
-    return [numpy_collate(samples) for samples in transposed]
-  else:
-    return np.array(batch)
-
 def get_dataloaders(batch_size=128):
     num_devices = jax.local_device_count()
     if batch_size % num_devices != 0:
         raise ValueError(f"Batch size ({batch_size}) must be divisible by the number of devices ({num_devices})")
+    
+    global_batch_size = batch_size
+    per_device_batch_size = global_batch_size // num_devices
 
-    transform = torchvision.transforms.Compose([
-        torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize((0.1307,), (0.3081,))
-    ])
+    # 定义数据变换
+    def apply_transform(sample):
+        image = sample["png"]
+        # PyTorch 的 transform 需要 PIL Image 对象
+        transform = transforms.Compose([
+            transforms.Grayscale(num_output_channels=1),
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,))
+        ])
+        sample["png"] = transform(image)
+        sample["cls"] = int(sample["cls"])
+        return sample
 
-    train_dataset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-    test_dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    # --- 训练集加载器 ---
+    train_urls = "./mnist_wds_train/mnist-train-{000000..000009}.tar"
+    train_dataset = wds.WebDataset(urls=train_urls, resampled=True).shuffle(1000).decode("pil").map(apply_transform).to_tuple("png", "cls").batched(per_device_batch_size)
+    
+    # --- 测试集加载器 ---
+    test_urls = "./mnist_wds_test/mnist-test-{000000..000001}.tar"
+    test_dataset = wds.WebDataset(urls=test_urls).decode("pil").map(apply_transform).to_tuple("png", "cls").batched(per_device_batch_size)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=numpy_collate, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=numpy_collate, drop_last=True)
-    return train_loader, test_loader
+    return train_dataset, test_dataset
 
 # -----------------------------------------------------------------------------
 # 2. 训练和评估逻辑
 # -----------------------------------------------------------------------------
-class TrainState(train_state.TrainState):
-    pass
+class TrainStateWithEMA(train_state.TrainState):
+    ema_params: flax.core.FrozenDict
 
-def train_step(state, batch):
+def train_step(state, batch, ema_decay=0.999):
     images, labels = batch
     def loss_fn(params):
         logits = state.apply_fn({'params': params}, images)
         one_hot = jax.nn.one_hot(labels, 10)
         loss = optax.softmax_cross_entropy(logits=logits, labels=one_hot).mean()
         return loss, logits
+    
     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     grads = jax.lax.pmean(grads, axis_name='batch')
-    state = state.apply_gradients(grads=grads)
+    new_state = state.apply_gradients(grads=grads)
+    
+    new_ema_params = jax.tree_util.tree_map(
+        lambda ema, p: ema * ema_decay + p * (1. - ema_decay),
+        state.ema_params, new_state.params
+    )
+    final_state = new_state.replace(ema_params=new_ema_params)
+
     loss = jax.lax.pmean(loss, axis_name='batch')
     accuracy = jax.lax.pmean(jnp.mean(jnp.argmax(logits, -1) == labels), axis_name='batch')
-    return state, loss, accuracy
+    
+    return final_state, loss, accuracy
 
 def eval_step(state, batch):
     images, labels = batch
-    logits = state.apply_fn({'params': state.params}, images)
+    logits = state.apply_fn({'params': state.ema_params}, images)
     loss = jax.lax.pmean(optax.softmax_cross_entropy(logits=logits, labels=jax.nn.one_hot(labels, 10)).mean(), axis_name='batch')
     accuracy = jax.lax.pmean(jnp.mean(jnp.argmax(logits, -1) == labels), axis_name='batch')
     return loss, accuracy
@@ -75,60 +89,68 @@ def eval_step(state, batch):
 # -----------------------------------------------------------------------------
 # 3. 初始化和主循环
 # -----------------------------------------------------------------------------
-def create_train_state(rng, learning_rate):
-    # 实例化我们的 ViT 模型
-    model = VisionTransformer()
-    # 用一个假的输入来初始化模型参数
-    params = model.init(rng, jnp.ones([1, 28, 28, 1]))['params']
+def create_train_state(rng, learning_rate, image_size, patch_size):
+    model = VisionTransformer(patch_size=patch_size)
+    dummy_input = jnp.ones([1, image_size, image_size, 1])
+    params = model.init(rng, dummy_input)['params']
     tx = optax.adam(learning_rate)
-    return TrainState.create(apply_fn=model.apply, params=params, tx=tx)
-
-def shard(data):
-    return jax.tree_util.tree_map(lambda x: x.reshape((jax.local_device_count(), -1) + x.shape[1:]), data)
+    return TrainStateWithEMA.create(
+        apply_fn=model.apply,
+        params=params,
+        tx=tx,
+        ema_params=params
+    )
 
 def main():
-    print(f"JAX backend: {xla_bridge.get_backend().platform}")
-    print(f"Number of devices: {jax.local_device_count()}")
+    print(f"JAX backend: {jax.default_backend()}")
+    num_devices = jax.local_device_count()
+    print(f"Number of devices: {num_devices}")
 
     LEARNING_RATE = 1e-3
     BATCH_SIZE = 128
     EPOCHS = 5
+    IMAGE_SIZE = 28
+    PATCH_SIZE = 4
 
     train_loader, test_loader = get_dataloaders(BATCH_SIZE)
-
-    # 用一个随机 key 来初始化模型
-    rng = jax.random.PRNGKey(0)
-    state = create_train_state(rng, LEARNING_RATE)
     
-    # 复制状态到所有设备
+    rng = jax.random.PRNGKey(0)
+    state = create_train_state(rng, LEARNING_RATE, IMAGE_SIZE, PATCH_SIZE)
     state = replicate(state)
 
-    # 创建并行版本的训练/评估函数
     p_train_step = pmap(train_step, axis_name='batch')
     p_eval_step = pmap(eval_step, axis_name='batch')
 
     for epoch in range(1, EPOCHS + 1):
         # --- 训练 ---
         train_loss, train_accuracy = 0., 0.
-        for batch_idx, (images, labels) in enumerate(train_loader):
-            images = np.transpose(images, (0, 2, 3, 1))
-            sharded_batch = shard((images, labels))
-            state, loss, acc = p_train_step(state, sharded_batch)
+        num_train_steps = 60000 // BATCH_SIZE
+        for i, (images, labels) in enumerate(train_loader):
+            if i >= num_train_steps: break
+            images = rearrange(images.numpy(), '(d b) c h w -> d b h w c', d=num_devices)
+            labels = rearrange(labels, '(d b) -> d b', d=num_devices)
+            
+            state, loss, acc = p_train_step(state, (images, labels))
             train_loss += loss[0]
             train_accuracy += acc[0]
-        avg_train_loss = train_loss / len(train_loader)
-        avg_train_acc = train_accuracy / len(train_loader)
+        
+        avg_train_loss = train_loss / num_train_steps
+        avg_train_acc = train_accuracy / num_train_steps
 
         # --- 评估 ---
         test_loss, test_accuracy = 0., 0.
-        for images, labels in test_loader:
-            images = np.transpose(images, (0, 2, 3, 1))
-            sharded_batch = shard((images, labels))
-            loss, acc = p_eval_step(state, sharded_batch)
+        num_test_steps = 10000 // BATCH_SIZE
+        for i, (images, labels) in enumerate(test_loader):
+            if i >= num_test_steps: break
+            images = rearrange(images.numpy(), '(d b) c h w -> d b h w c', d=num_devices)
+            labels = rearrange(labels, '(d b) -> d b', d=num_devices)
+            
+            loss, acc = p_eval_step(state, (images, labels))
             test_loss += loss[0]
             test_accuracy += acc[0]
-        avg_test_loss = test_loss / len(test_loader)
-        avg_test_acc = test_accuracy / len(test_loader)
+            
+        avg_test_loss = test_loss / num_test_steps
+        avg_test_acc = test_accuracy / num_test_steps
 
         print(
             f"Epoch {epoch} | "
